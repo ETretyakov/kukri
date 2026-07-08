@@ -1,0 +1,24 @@
+# secrets
+.env
+
+# model weights — download with: go run ./cmd/download
+models/
+
+# generated benchmark artifacts
+corpus.jsonl
+bench/gold.jsonl
+bench/__pycache__/
+bench/.venv/
+
+# IDE
+.idea/
+.vscode/
+
+# Go build
+*.test
+*.out
+/kukri
+
+# OS
+.DS_Store
+Thumbs.db
