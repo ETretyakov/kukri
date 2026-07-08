@@ -24,7 +24,7 @@ import numpy as np
 from tabulate import tabulate
 
 from chonkie import SemanticChunker, TokenChunker
-from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_text_splitters import MarkdownHeaderTextSplitter, RecursiveCharacterTextSplitter
 from llama_index.core.node_parser import SentenceSplitter
 
 
@@ -151,8 +151,8 @@ def main():
     ap.add_argument("--max-docs",   type=int,   default=None)
     ap.add_argument("--output",     default="-")
     ap.add_argument("--strategies", nargs="+",
-                    default=["kukri", "fixed_token", "semantic", "sentence", "recursive"],
-                    choices=["kukri", "fixed_token", "semantic", "sentence", "recursive"])
+                    default=["kukri", "fixed_token", "semantic", "sentence", "recursive", "markdown"],
+                    choices=["kukri", "fixed_token", "semantic", "sentence", "recursive", "markdown"])
     args = ap.parse_args()
 
     # --- load gold pairs --------------------------------------------------------
@@ -185,11 +185,25 @@ def main():
     sentence_splitter = SentenceSplitter(chunk_size=mt, chunk_overlap=args.overlap)
     recursive_spl    = RecursiveCharacterTextSplitter(chunk_size=mt * 4, chunk_overlap=100)
 
+    # MarkdownHeaderTextSplitter: split on H1/H2/H3, then further split large
+    # sections so chunks stay comparable in size to the other strategies.
+    md_header_spl = MarkdownHeaderTextSplitter(
+        headers_to_split_on=[("#", "h1"), ("##", "h2"), ("###", "h3")],
+        strip_headers=False,
+    )
+    md_char_spl = RecursiveCharacterTextSplitter(chunk_size=mt * 4, chunk_overlap=100)
+
+    def _chunk_markdown_splitter(text: str) -> list[str]:
+        header_docs = md_header_spl.split_text(text)
+        docs = md_char_spl.split_documents(header_docs)
+        return [doc.page_content for doc in docs]
+
     strategy_fns = {
-        "fixed_token": lambda t: [c.text for c in token_chunker.chunk(t)],
-        "semantic":    lambda t: [c.text for c in semantic_chunker.chunk(t)],
-        "sentence":    lambda t: sentence_splitter.split_text(t),
-        "recursive":   lambda t: recursive_spl.split_text(t),
+        "fixed_token":   lambda t: [c.text for c in token_chunker.chunk(t)],
+        "semantic":      lambda t: [c.text for c in semantic_chunker.chunk(t)],
+        "sentence":      lambda t: sentence_splitter.split_text(t),
+        "recursive":     lambda t: recursive_spl.split_text(t),
+        "markdown":      _chunk_markdown_splitter,
     }
 
     # --- run strategies ---------------------------------------------------------

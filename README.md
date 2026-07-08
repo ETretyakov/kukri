@@ -13,12 +13,13 @@ Most chunkers treat a document as a flat stream of tokens. Kukri treats it as a 
 | **kukri** | **93.6%** | **53** | structural + semantic |
 | semantic | 88.4% | 61 | semantic only, no structure |
 | fixed_token | 60.6% | 62 | splits blindly |
+| markdown | 99.6% | 134 | langchain MarkdownHeaderTextSplitter |
 | sentence | 98.9% | 212 | large chunks, poor precision |
 | recursive | 99.6% | 185 | large chunks, poor precision |
 
 **Coverage** = % of gold answer spans fully contained within a single chunk (measured on 886 QA pairs from 248 IAEA technical documents, 95% CI ≈ ±1.6 pp, see [Benchmarks](#benchmarks)).
 
-Sentence and recursive splitters win on coverage only because their chunks are 3–4× larger. At comparable chunk sizes, kukri delivers **+36 pp over fixed_token** and **+4 pp over pure semantic** — while producing precise, retrieval-friendly chunks.
+The closest competitor is a markdown-aware splitter (langchain `MarkdownHeaderTextSplitter`), which reaches 99.6% coverage — but only by producing chunks that are **2.5× larger** (134 vs 53 tokens). At comparable chunk sizes, kukri delivers **+36 pp over fixed_token** and **+4 pp over pure semantic** while staying at half the chunk size of any structural alternative.
 
 ---
 
@@ -201,10 +202,11 @@ Measures what % of gold answer spans (exact verbatim quotes from source document
 | **kukri** | **93.6%** | **53** | **1.77** | 183 113 |
 | semantic | 88.4% | 61 | 1.45 | 163 612 |
 | fixed_token | 60.6% | 62 | 0.98 | 182 614 |
-| sentence | 98.9% | 212 | 0.47 | 50 432 |
+| markdown | 99.6% | 134 | 0.74 | 75 396 |
 | recursive | 99.6% | 185 | 0.54 | 54 823 |
+| sentence | 98.9% | 212 | 0.47 | 50 432 |
 
-**Coverage/token** = coverage% ÷ avg_tokens × 100 — measures how efficiently a strategy packs answer spans into its chunks. Sentence and recursive score high on raw coverage only because their chunks are 3–4× larger; at equal chunk size budgets they drop below kukri.
+**Coverage/token** = coverage% ÷ avg_tokens × 100 — measures how efficiently a strategy packs answer spans into its chunks. The langchain `MarkdownHeaderTextSplitter` (`markdown`) is the closest structural competitor to kukri: it achieves equal raw coverage (99.6%) by splitting on headers, but its chunks are **2.5× larger** — resulting in a Coverage/token of 0.74 vs kukri's 1.77. Kukri combines header-level segmentation with sentence-level semantic merging to produce compact, precise chunks without sacrificing structural awareness.
 
 ### Running the coverage benchmark
 
