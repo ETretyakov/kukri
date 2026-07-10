@@ -9,70 +9,50 @@ import (
 	"os"
 
 	"github.com/ETretyakov/kukri/chunker"
-	"github.com/ETretyakov/kukri/embedder"
 	"github.com/ETretyakov/kukri/parser"
 	"github.com/ETretyakov/kukri/segmenter"
 	"github.com/ETretyakov/kukri/types"
 )
 
 func main() {
-	input     := flag.String("input",      "",    "path to markdown file (single-file mode)")
-	output    := flag.String("output",     "",    "path to output file (default: stdout)")
-	modelPath := flag.String("model",      "",    "path to sentence-transformer model directory (required)")
-	maxTokens := flag.Int("max-tokens",    512,   "soft upper limit for chunk size in tokens")
-	threshold := flag.Float64("threshold", 0.7,   "minimum cosine similarity to keep sentences together [0,1]")
-	batch     := flag.Bool("batch",        false, "batch mode: read JSONL {\"id\":\"...\",\"text\":\"...\"} from -input, write JSONL per doc")
+	input             := flag.String("input",               "",     "path to markdown file (single-file mode)")
+	output            := flag.String("output",              "",     "path to output file (default: stdout)")
+	maxTokens         := flag.Int("max-tokens",             128,    "soft upper limit for chunk size in tokens")
+	threshold         := flag.Float64("threshold",          0,      "minimum similarity to merge adjacent blocks [0,1]; 0 = always merge up to max-tokens")
+	batch             := flag.Bool("batch",                 false,  "batch mode: read JSONL {\"id\":\"...\",\"text\":\"...\"} from -input")
+	prependSectionPath := flag.Bool("prepend-section-path", false,  "prepend section breadcrumb to embed_text (for BGE/E5 models)")
 	flag.Parse()
 
-	if *modelPath == "" {
-		fmt.Fprintln(os.Stderr, "error: -model is required")
-		flag.Usage()
-		os.Exit(1)
+	cfg := types.Config{
+		MaxTokens:          *maxTokens,
+		Threshold:          float32(*threshold),
+		PrependSectionPath: *prependSectionPath,
 	}
 
 	ctx := context.Background()
-
-	fmt.Fprintf(os.Stderr, "loading model from %s...\n", *modelPath)
-	emb, err := embedder.New(ctx, *modelPath)
-	if err != nil {
-		fatalf("load embedder: %v", err)
-	}
-	defer emb.Close()
-
-	cfg := types.Config{
-		MaxTokens: *maxTokens,
-		Threshold: float32(*threshold),
-		ModelPath: *modelPath,
-	}
-
 	if *batch {
-		runBatch(ctx, cfg, emb, *input, *output)
+		runBatch(ctx, cfg, *input, *output)
 	} else {
-		runSingle(ctx, cfg, emb, *input, *output)
+		runSingle(ctx, cfg, *input, *output)
 	}
 }
 
-// runSingle processes one markdown file.
-func runSingle(ctx context.Context, cfg types.Config, emb *embedder.Embedder, inputPath, outputPath string) {
+func runSingle(ctx context.Context, cfg types.Config, inputPath, outputPath string) {
 	if inputPath == "" {
 		fmt.Fprintln(os.Stderr, "error: -input is required in single-file mode")
 		os.Exit(1)
 	}
-
 	raw, err := os.ReadFile(inputPath)
 	if err != nil {
 		fatalf("read input: %v", err)
 	}
-
 	cfg.Source = inputPath
-	chunks, err := chop(ctx, cfg, emb, string(raw))
+	chunks, err := chop(ctx, cfg, string(raw))
 	if err != nil {
 		fatalf("chop: %v", err)
 	}
-
 	out := openOutput(outputPath)
 	defer out.Close()
-
 	enc := json.NewEncoder(out)
 	enc.SetIndent("", "  ")
 	if err := enc.Encode(types.Result{Chunks: chunks}); err != nil {
@@ -81,10 +61,7 @@ func runSingle(ctx context.Context, cfg types.Config, emb *embedder.Embedder, in
 	fmt.Fprintf(os.Stderr, "done: %d chunks\n", len(chunks))
 }
 
-// runBatch reads JSONL {"id":"...","text":"..."} and writes one JSONL line per doc.
-// Output line format: {"id":"...","chunks":[...]}
-// The embedding model is loaded once for the whole corpus.
-func runBatch(ctx context.Context, cfg types.Config, emb *embedder.Embedder, inputPath, outputPath string) {
+func runBatch(ctx context.Context, cfg types.Config, inputPath, outputPath string) {
 	var in *os.File
 	if inputPath == "" || inputPath == "-" {
 		in = os.Stdin
@@ -102,7 +79,7 @@ func runBatch(ctx context.Context, cfg types.Config, emb *embedder.Embedder, inp
 
 	enc := json.NewEncoder(out)
 	scanner := bufio.NewScanner(in)
-	scanner.Buffer(make([]byte, 10*1024*1024), 10*1024*1024) // 10 MB per line
+	scanner.Buffer(make([]byte, 10*1024*1024), 10*1024*1024)
 
 	type batchInput struct {
 		ID   string `json:"id"`
@@ -120,14 +97,12 @@ func runBatch(ctx context.Context, cfg types.Config, emb *embedder.Embedder, inp
 			fmt.Fprintf(os.Stderr, "skip malformed line: %v\n", err)
 			continue
 		}
-
 		cfg.Source = doc.ID
-		chunks, err := chop(ctx, cfg, emb, doc.Text)
+		chunks, err := chop(ctx, cfg, doc.Text)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "error processing %s: %v\n", doc.ID, err)
 			continue
 		}
-
 		if err := enc.Encode(batchOutput{ID: doc.ID, Chunks: chunks}); err != nil {
 			fatalf("encode: %v", err)
 		}
@@ -140,9 +115,8 @@ func runBatch(ctx context.Context, cfg types.Config, emb *embedder.Embedder, inp
 	fmt.Fprintf(os.Stderr, "done: %d docs → %d chunks\n", docs, total)
 }
 
-// chop runs the full parse→segment→chunk pipeline on a text.
-func chop(ctx context.Context, cfg types.Config, emb *embedder.Embedder, text string) ([]types.Chunk, error) {
-	c := chunker.New(cfg, emb)
+func chop(ctx context.Context, cfg types.Config, text string) ([]types.Chunk, error) {
+	c := chunker.New(cfg, nil)
 	return c.Chop(ctx, segmenter.Segment(parser.Parse(text)))
 }
 

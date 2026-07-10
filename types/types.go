@@ -1,5 +1,5 @@
 // Package types defines the shared data structures passed between the
-// parser, segmenter, embedder, and chunker stages of the kukri pipeline.
+// parser, segmenter, and chunker stages of the kukri pipeline.
 package types
 
 // BlockType classifies a parsed Markdown element.
@@ -16,8 +16,6 @@ const (
 )
 
 // Block is a single typed unit parsed from a Markdown document.
-// It is an intermediate representation consumed by the segmenter; headers
-// are not present in the final []Chunk output.
 type Block struct {
 	Type      BlockType
 	Content   string
@@ -51,6 +49,13 @@ type Chunk struct {
 	// Text is the raw chunk content as it appears in the source document.
 	Text string `json:"text"`
 
+	// EmbedText is the text to pass to the embedding model.
+	// By default equals Text. When Config.PrependSectionPath is true,
+	// it is prefixed with the section breadcrumb:
+	//   "Chapter 2 > Safety Analysis\n\n[chunk text]"
+	// Downstream consumers should embed EmbedText but display Text.
+	EmbedText string `json:"embed_text,omitempty"`
+
 	// Section is the title of the heading this chunk falls under.
 	Section string `json:"section"`
 
@@ -79,19 +84,23 @@ type Result struct {
 // Config holds the parameters that control the chunking pipeline.
 type Config struct {
 	// MaxTokens is the soft upper limit on chunk size (word count).
-	// Text blocks exceeding this are split; code/image/diagram blocks are
-	// always emitted whole regardless of size.
+	// Adjacent text blocks are merged until adding the next block would
+	// exceed this limit. Code/image/diagram blocks are always emitted whole.
 	MaxTokens int
 
-	// Threshold is the minimum cosine similarity [0, 1] required to merge
-	// two adjacent sentences into the same chunk.  Lower values produce
-	// larger, more topically diverse chunks; higher values produce finer,
-	// more homogeneous chunks.
+	// Threshold is the minimum similarity score [0, 1] required to merge
+	// two adjacent blocks. With no Scorer (nil), block similarities are
+	// always 0, so Threshold=0 merges everything up to MaxTokens and
+	// Threshold>0 keeps blocks separate.
 	Threshold float32
-
-	// ModelPath is the path to the ONNX sentence-transformer model directory.
-	ModelPath string
 
 	// Source is the filename or document ID attached to every chunk's Source field.
 	Source string
+
+	// PrependSectionPath prepends the section breadcrumb to EmbedText:
+	//   "Chapter 2 > Safety Analysis\n\n[chunk text]"
+	// Default false: EmbedText == Text.
+	// Beneficial for models trained with passage-prefix formats (BGE, E5);
+	// hurts retrieval quality with all-MiniLM-L6-v2.
+	PrependSectionPath bool
 }
