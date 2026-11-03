@@ -1,27 +1,13 @@
-// Package chunker converts []Section into []Chunk.
-//
-// Adjacent text blocks within a section are merged greedily: two blocks are
-// combined when scorer.Score(block_i, block_{i+1}) >= Config.Threshold AND
-// the combined token count stays within Config.MaxTokens.
-//
-// When no Scorer is provided (nil), block similarity is always 0.  Setting
-// Threshold=0 therefore merges every adjacent block up to MaxTokens — the
-// recommended default for IAEA-style documents where structure is already
-// encoded in section boundaries.
-//
-// Non-text blocks are never merged across their boundaries:
-//   - table   — emitted as one chunk; split row-by-row if it exceeds MaxTokens
-//               (header repeated in every part).
-//   - list    — emitted as one chunk; split on top-level item boundaries if needed.
-//   - code / diagram / image — always one chunk, regardless of size.
-//
-// Every chunk receives a slug-based ID "<section-slug>_<counter>" and is
-// doubly linked via PrevID / NextID for context-window retrieval.
+// Package chunker converts sections into chunks. Text runs are merged by
+// explicit mode (none, size, similarity), without crossing non-text blocks or
+// section boundaries. Candidate sizes include separators. Oversized atomic
+// elements are reported, or rejected under OversizeError.
 package chunker
 
 import (
 	"context"
 	"fmt"
+	"math"
 	"strings"
 	"unicode"
 	"unicode/utf8"
@@ -33,36 +19,164 @@ import (
 // Chunker orchestrates the full block→chunk pipeline.
 type Chunker struct {
 	cfg types.Config
-	scr scorer.Scorer // nil → similarity always 0
+	scr scorer.Scorer // required only by MergeSimilarity
 }
 
-// New creates a Chunker. scr may be nil; blocks are then merged purely by
-// token count (similarity is treated as 0 for every adjacent pair).
+// New creates a Chunker. The default mode merges by size with no Scorer.
+// Configuration is validated by Validate or Chop.
 func New(cfg types.Config, scr scorer.Scorer) *Chunker {
+	if cfg.MergeMode == "" {
+		cfg.MergeMode = types.MergeSize
+	}
+	if cfg.OversizePolicy == "" {
+		cfg.OversizePolicy = types.OversizeKeep
+	}
+	if cfg.LengthFunc == nil {
+		cfg.LengthFunc = countTokens
+		cfg.LengthUnit = "words"
+	}
+	if cfg.EmbeddingBudget != nil {
+		budget := *cfg.EmbeddingBudget
+		cfg.EmbeddingBudget = &budget
+	}
+	if cfg.DocumentBudget != nil {
+		budget := *cfg.DocumentBudget
+		if budget.Strategy == "" {
+			budget.Strategy = types.SelectTermsContext
+		}
+		cfg.DocumentBudget = &budget
+	}
 	return &Chunker{cfg: cfg, scr: scr}
 }
 
-// Chop converts a flat list of sections into linked, ID-bearing chunks.
-func (c *Chunker) Chop(ctx context.Context, sections []types.Section) ([]types.Chunk, error) {
-	var all []types.Chunk
+// Validate checks configuration without processing any input.
+func (c *Chunker) Validate() error {
+	if err := c.validateDocumentBudget(); err != nil {
+		return err
+	}
+	if c.cfg.MaxTokens < 0 || (c.cfg.MaxTokens == 0 && c.cfg.EmbeddingBudget == nil) {
+		return fmt.Errorf("MaxTokens must be positive, or zero with EmbeddingBudget")
+	}
+	if c.cfg.LengthUnit == "" {
+		return fmt.Errorf("LengthUnit is required with a custom LengthFunc")
+	}
+	if c.length("") != 0 {
+		return fmt.Errorf("LengthFunc must return 0 for empty text")
+	}
+	if c.cfg.RepackText && c.cfg.MergeMode != types.MergeSize {
+		return fmt.Errorf("RepackText requires MergeSize")
+	}
+	if b := c.cfg.EmbeddingBudget; b != nil {
+		if b.MaxTokens <= 0 || b.Tokenizer == "" || b.CountTokens == nil {
+			return fmt.Errorf("EmbeddingBudget requires positive MaxTokens, Tokenizer and CountTokens")
+		}
+		if _, err := c.embeddingLength(""); err != nil {
+			return err
+		}
+	}
+	if math.IsNaN(float64(c.cfg.Threshold)) || math.IsInf(float64(c.cfg.Threshold), 0) || c.cfg.Threshold < 0 || c.cfg.Threshold > 1 {
+		return fmt.Errorf("Threshold must be finite and in [0,1]")
+	}
+	switch c.cfg.MergeMode {
+	case types.MergeSize, types.MergeNone:
+		if c.cfg.Threshold != 0 || c.scr != nil {
+			return fmt.Errorf("Threshold and Scorer require MergeSimilarity; use MergeNone to disable merging")
+		}
+	case types.MergeSimilarity:
+		if c.scr == nil {
+			return fmt.Errorf("MergeSimilarity requires a Scorer")
+		}
+	default:
+		return fmt.Errorf("unknown merge mode %q", c.cfg.MergeMode)
+	}
+	if c.cfg.OversizePolicy != types.OversizeKeep && c.cfg.OversizePolicy != types.OversizeError {
+		return fmt.Errorf("unknown oversize policy %q", c.cfg.OversizePolicy)
+	}
+	return nil
+}
+
+func (c *Chunker) length(text string) int { return c.cfg.LengthFunc(text) }
+
+// chopAll builds the complete representation before optional lossy selection.
+func (c *Chunker) chopAll(ctx context.Context, sections []types.Section) ([]types.Chunk, error) {
+	if err := c.Validate(); err != nil {
+		return nil, err
+	}
+	all := make([]types.Chunk, 0)
 	for _, sec := range sections {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		for _, b := range sec.Blocks {
+			if strings.TrimSpace(b.Content) != "" && c.length(b.Content) <= 0 {
+				return nil, fmt.Errorf("length function returned a non-positive size for non-empty content")
+			}
+		}
 		chunks, err := c.processSection(ctx, sec)
 		if err != nil {
 			return nil, fmt.Errorf("section %q: %w", sec.Title, err)
 		}
 		all = append(all, chunks...)
 	}
+	for _, chunk := range all {
+		if strings.TrimSpace(chunk.Text) != "" && chunk.Size <= 0 {
+			return nil, fmt.Errorf("length function returned a non-positive chunk size")
+		}
+		if c.cfg.OversizePolicy == types.OversizeError && chunk.EmbeddingOversized {
+			return nil, fmt.Errorf("%s at lines %v exceeds embedding budget: %d > %d tokens (%s)", chunk.BlockType, chunk.SourceLines, chunk.EmbeddingTokens, c.cfg.EmbeddingBudget.MaxTokens, chunk.EmbeddingOversizeReason)
+		}
+		if c.cfg.OversizePolicy == types.OversizeError && chunk.Oversized {
+			return nil, fmt.Errorf("%s at lines %v exceeds budget: %d > %d %s (%s)", chunk.BlockType, chunk.SourceLines, chunk.Size, c.cfg.MaxTokens, chunk.SizeUnit, chunk.OversizeReason)
+		}
+	}
 	assignIDs(all)
 	link(all)
 	return all, nil
 }
 
-// processSection merges text blocks within the section, emitting non-text
-// blocks independently.
+// embeddingLength never truncates input. Tokenizer errors abort the operation.
+func (c *Chunker) embeddingLength(text string) (int, error) {
+	if c.cfg.EmbeddingBudget == nil {
+		return 0, nil
+	}
+	n, err := c.cfg.EmbeddingBudget.CountTokens(text)
+	if err != nil {
+		return 0, fmt.Errorf("embedding token counter: %w", err)
+	}
+	if n < 0 {
+		return 0, fmt.Errorf("embedding token counter returned negative count %d", n)
+	}
+	return n, nil
+}
+
+func (c *Chunker) embedText(text string, sec types.Section, kind ...types.BlockType) string {
+	if c.cfg.CompactTableEmbedding && len(kind) > 0 && kind[0] == types.BlockTable {
+		text = compactTableEmbedding(text)
+	}
+	if c.cfg.PrependSectionPath && len(sec.Path) > 0 {
+		return strings.Join(sec.Path, " > ") + "\n\n" + text
+	}
+	return text
+}
+
+func (c *Chunker) fits(text string, sec types.Section, kind ...types.BlockType) (bool, error) {
+	n := c.length(text)
+	if strings.TrimSpace(text) != "" && n <= 0 {
+		return false, fmt.Errorf("length function returned a non-positive candidate size")
+	}
+	if c.cfg.MaxTokens > 0 && n > c.cfg.MaxTokens {
+		return false, nil
+	}
+	e, err := c.embeddingLength(c.embedText(text, sec, kind...))
+	if err != nil {
+		return false, err
+	}
+	return c.cfg.EmbeddingBudget == nil || e <= c.cfg.EmbeddingBudget.MaxTokens, nil
+}
+
 func (c *Chunker) processSection(ctx context.Context, sec types.Section) ([]types.Chunk, error) {
 	var chunks []types.Chunk
 	var textRun []types.Block
-
 	flush := func() error {
 		if len(textRun) == 0 {
 			return nil
@@ -75,40 +189,55 @@ func (c *Chunker) processSection(ctx context.Context, sec types.Section) ([]type
 		textRun = nil
 		return nil
 	}
-
 	for _, block := range sec.Blocks {
-		switch block.Type {
-		case types.BlockText:
-			textRun = append(textRun, block)
-		case types.BlockTable:
-			if err := flush(); err != nil {
-				return nil, err
-			}
-			chunks = append(chunks, c.chunkTable(block, sec)...)
-		case types.BlockList:
-			if err := flush(); err != nil {
-				return nil, err
-			}
-			chunks = append(chunks, c.chunkList(block, sec)...)
-		case types.BlockImage, types.BlockCode, types.BlockDiagram:
-			if err := flush(); err != nil {
-				return nil, err
-			}
-			chunks = append(chunks, c.makeChunk(block.Content, block, sec))
+		if err := ctx.Err(); err != nil {
+			return nil, err
 		}
+		if block.Type == types.BlockText {
+			if strings.TrimSpace(block.Content) != "" {
+				textRun = append(textRun, block)
+			}
+			continue
+		}
+		if err := flush(); err != nil {
+			return nil, err
+		}
+		var produced []types.Chunk
+		var err error
+		switch block.Type {
+		case types.BlockTable:
+			produced, err = c.chunkTable(ctx, block, sec)
+		case types.BlockList:
+			produced, err = c.chunkList(ctx, block, sec)
+		case types.BlockImage, types.BlockCode, types.BlockDiagram:
+			var ch types.Chunk
+			ch, err = c.makeChunk(block.Content, block, sec)
+			produced = []types.Chunk{ch}
+		default:
+			return nil, fmt.Errorf("unsupported content block type %q", block.Type)
+		}
+		if err != nil {
+			return nil, err
+		}
+		chunks = append(chunks, produced...)
 	}
-	return chunks, flush()
+	if err := flush(); err != nil {
+		return nil, err
+	}
+	return chunks, nil
 }
 
-// mergeTextBlocks scores adjacent blocks pairwise and merges greedily.
-// A single block that exceeds MaxTokens is split at sentence boundaries.
+// mergeTextBlocks preserves historical paragraph-first grouping unless
+// RepackText is enabled. Similarity scores always describe original paragraphs.
 func (c *Chunker) mergeTextBlocks(ctx context.Context, blocks []types.Block, sec types.Section) ([]types.Chunk, error) {
 	if len(blocks) == 0 {
 		return nil, nil
 	}
-
+	if c.cfg.RepackText {
+		return c.repackText(ctx, blocks, sec)
+	}
 	var sims []float32
-	if c.scr != nil && len(blocks) >= 2 {
+	if c.cfg.MergeMode == types.MergeSimilarity && len(blocks) >= 2 {
 		contents := make([]string, len(blocks))
 		for i, b := range blocks {
 			contents[i] = b.Content
@@ -119,37 +248,51 @@ func (c *Chunker) mergeTextBlocks(ctx context.Context, blocks []types.Block, sec
 			return nil, err
 		}
 	} else {
-		sims = make([]float32, len(blocks)-1) // all zeros
+		sims = make([]float32, len(blocks)-1)
 	}
-
-	// Greedy merge: extend current group while sim >= threshold and
-	// combined tokens <= MaxTokens.
+	if len(sims) != len(blocks)-1 {
+		return nil, fmt.Errorf("scorer returned %d scores for %d blocks; want %d", len(sims), len(blocks), len(blocks)-1)
+	}
+	for _, sim := range sims {
+		if math.IsNaN(float64(sim)) || math.IsInf(float64(sim), 0) || sim < -1 || sim > 1 {
+			return nil, fmt.Errorf("scorer returned invalid similarity %v; expected finite value in [-1,1]", sim)
+		}
+	}
 	var groups [][]types.Block
 	cur := []types.Block{blocks[0]}
-	curTokens := countTokens(blocks[0].Content)
-
+	curText := blocks[0].Content
 	for i := 1; i < len(blocks); i++ {
-		nextTokens := countTokens(blocks[i].Content)
-		if sims[i-1] >= c.cfg.Threshold && curTokens+nextTokens <= c.cfg.MaxTokens {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		candidate := curText + "\n\n" + blocks[i].Content
+		allowed := c.cfg.MergeMode == types.MergeSize || (c.cfg.MergeMode == types.MergeSimilarity && sims[i-1] >= c.cfg.Threshold)
+		fit, err := c.fits(candidate, sec)
+		if err != nil {
+			return nil, err
+		}
+		if allowed && fit {
 			cur = append(cur, blocks[i])
-			curTokens += nextTokens
+			curText = candidate
 		} else {
 			groups = append(groups, cur)
 			cur = []types.Block{blocks[i]}
-			curTokens = nextTokens
+			curText = blocks[i].Content
 		}
 	}
 	groups = append(groups, cur)
-
 	var out []types.Chunk
 	for _, group := range groups {
-		if len(group) == 1 && countTokens(group[0].Content) > c.cfg.MaxTokens {
-			// Single oversized block: split at sentence boundaries.
-			out = append(out, c.splitByTokens(splitSentences(group[0].Content), group[0], sec)...)
-			continue
+		fit, err := c.fits(group[0].Content, sec)
+		if err != nil {
+			return nil, err
 		}
-		if len(group) == 1 {
-			out = append(out, c.makeChunk(group[0].Content, group[0], sec))
+		if len(group) == 1 && !fit {
+			parts, err := c.splitByTokens(ctx, splitSentences(group[0].Content), group[0], sec)
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, parts...)
 			continue
 		}
 		parts := make([]string, len(group))
@@ -158,132 +301,278 @@ func (c *Chunker) mergeTextBlocks(ctx context.Context, blocks []types.Block, sec
 		}
 		span := group[0]
 		span.LineEnd = group[len(group)-1].LineEnd
-		out = append(out, c.makeChunk(strings.Join(parts, "\n\n"), span, sec))
+		ch, err := c.makeChunk(strings.Join(parts, "\n\n"), span, sec)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, ch)
 	}
 	return out, nil
 }
 
-// splitByTokens groups sentences into chunks bounded by MaxTokens.
-func (c *Chunker) splitByTokens(sentences []string, block types.Block, sec types.Section) []types.Chunk {
-	var chunks []types.Chunk
-	var cur []string
-	curTokens := 0
-
-	for _, s := range sentences {
-		t := countTokens(s)
-		if len(cur) > 0 && curTokens+t > c.cfg.MaxTokens {
-			chunks = append(chunks, c.makeChunk(strings.Join(cur, " "), block, sec))
-			cur = nil
-			curTokens = 0
+// repackText first splits each original paragraph, then greedily packs the
+// fragments. Paragraph separators are retained; no structural boundary is crossed.
+func (c *Chunker) repackText(ctx context.Context, blocks []types.Block, sec types.Section) ([]types.Chunk, error) {
+	var out []types.Chunk
+	var pending *types.Chunk
+	lastParagraph := -1
+	for i, block := range blocks {
+		if err := ctx.Err(); err != nil {
+			return nil, err
 		}
-		cur = append(cur, s)
-		curTokens += t
+		fit, err := c.fits(block.Content, sec)
+		if err != nil {
+			return nil, err
+		}
+		var parts []types.Chunk
+		if fit {
+			ch, err := c.makeChunk(block.Content, block, sec)
+			if err != nil {
+				return nil, err
+			}
+			parts = []types.Chunk{ch}
+		} else {
+			parts, err = c.splitByTokens(ctx, splitSentences(block.Content), block, sec)
+			if err != nil {
+				return nil, err
+			}
+		}
+		for _, part := range parts {
+			if pending != nil {
+				sep := " "
+				if lastParagraph != i {
+					sep = "\n\n"
+				}
+				candidate := pending.Text + sep + part.Text
+				fit, err := c.fits(candidate, sec)
+				if err != nil {
+					return nil, err
+				}
+				if fit {
+					span := block
+					span.LineStart = pending.SourceLines[0]
+					ch, err := c.makeChunk(candidate, span, sec)
+					if err != nil {
+						return nil, err
+					}
+					pending = &ch
+					lastParagraph = i
+					continue
+				}
+				out = append(out, *pending)
+			}
+			ch := part
+			pending = &ch
+			lastParagraph = i
+		}
 	}
-	if len(cur) > 0 {
-		chunks = append(chunks, c.makeChunk(strings.Join(cur, " "), block, sec))
+	if pending != nil {
+		out = append(out, *pending)
 	}
-	return chunks
+	return out, nil
 }
 
-// chunkTable returns the table as one chunk, or splits row-by-row repeating
-// the header in every part.
-func (c *Chunker) chunkTable(block types.Block, sec types.Section) []types.Chunk {
-	if countTokens(block.Content) <= c.cfg.MaxTokens {
-		return []types.Chunk{c.makeChunk(block.Content, block, sec)}
+func (c *Chunker) splitByTokens(ctx context.Context, sentences []string, block types.Block, sec types.Section) ([]types.Chunk, error) {
+	// If metadata alone exceeds the limit, token-based splitting cannot repair
+	// it. Retain ordinary body-budget splitting instead of emitting one chunk per
+	// word. makeChunk still measures and reports the full input overflow.
+	splitter := c
+	if budget := c.cfg.EmbeddingBudget; budget != nil {
+		n, err := c.embeddingLength(c.embedText("", sec))
+		if err != nil {
+			return nil, err
+		}
+		if n > budget.MaxTokens {
+			bodyOnly := *c
+			bodyOnly.cfg.EmbeddingBudget = nil
+			splitter = &bodyOnly
+		}
 	}
-
-	lines := strings.Split(block.Content, "\n")
-	if len(lines) < 3 {
-		return []types.Chunk{c.makeChunk(block.Content, block, sec)}
+	var chunks []types.Chunk
+	cur := ""
+	flush := func() error {
+		if cur != "" {
+			ch, err := c.makeChunk(cur, block, sec)
+			if err != nil {
+				return err
+			}
+			chunks = append(chunks, ch)
+			cur = ""
+		}
+		return nil
 	}
+	appendPart := func(part string) error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		candidate := part
+		if cur != "" {
+			candidate = cur + " " + part
+		}
+		fit, err := splitter.fits(candidate, sec)
+		if err != nil {
+			return err
+		}
+		if cur != "" && !fit {
+			if err := flush(); err != nil {
+				return err
+			}
+			candidate = part
+		}
+		cur = candidate
+		return nil
+	}
+	for _, sentence := range sentences {
+		fit, err := splitter.fits(sentence, sec)
+		if err != nil {
+			return nil, err
+		}
+		if fit {
+			if err := appendPart(sentence); err != nil {
+				return nil, err
+			}
+			continue
+		}
+		if err := flush(); err != nil {
+			return nil, err
+		}
+		for _, word := range strings.Fields(sentence) {
+			if err := appendPart(word); err != nil {
+				return nil, err
+			}
+		}
+	}
+	if err := flush(); err != nil {
+		return nil, err
+	}
+	return chunks, nil
+}
 
-	header := lines[0]
-	separator := lines[1]
-	dataRows := lines[2:]
-	headerTokens := countTokens(header) + countTokens(separator)
-
+// packItems preserves indivisible rows/items. Every table fragment repeats the
+// same header, which is included in both budget checks.
+func (c *Chunker) packItems(ctx context.Context, items []string, header string, block types.Block, sec types.Section) ([]types.Chunk, error) {
 	var chunks []types.Chunk
 	var batch []string
-	batchTokens := headerTokens
-
-	for _, row := range dataRows {
-		rt := countTokens(row)
-		if len(batch) > 0 && batchTokens+rt > c.cfg.MaxTokens {
-			chunks = append(chunks, c.makeChunk(header+"\n"+separator+"\n"+strings.Join(batch, "\n"), block, sec))
-			batch = nil
-			batchTokens = headerTokens
+	flush := func() error {
+		if len(batch) == 0 {
+			return nil
 		}
-		batch = append(batch, row)
-		batchTokens += rt
+		ch, err := c.makeChunk(header+strings.Join(batch, "\n"), block, sec)
+		if err != nil {
+			return err
+		}
+		chunks = append(chunks, ch)
+		batch = nil
+		return nil
 	}
-	if len(batch) > 0 {
-		chunks = append(chunks, c.makeChunk(header+"\n"+separator+"\n"+strings.Join(batch, "\n"), block, sec))
+	for _, item := range items {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		candidate := header + strings.Join(batch, "\n")
+		if len(batch) > 0 {
+			candidate += "\n"
+		}
+		candidate += item
+		fit, err := c.fits(candidate, sec, block.Type)
+		if err != nil {
+			return nil, err
+		}
+		if len(batch) > 0 && !fit {
+			if err := flush(); err != nil {
+				return nil, err
+			}
+		}
+		batch = append(batch, item)
 	}
-	return chunks
+	if err := flush(); err != nil {
+		return nil, err
+	}
+	return chunks, nil
 }
 
-// chunkList returns the list as one chunk, or splits on top-level item
-// boundaries.
-func (c *Chunker) chunkList(block types.Block, sec types.Section) []types.Chunk {
-	if countTokens(block.Content) <= c.cfg.MaxTokens {
-		return []types.Chunk{c.makeChunk(block.Content, block, sec)}
+func (c *Chunker) chunkTable(ctx context.Context, block types.Block, sec types.Section) ([]types.Chunk, error) {
+	fit, err := c.fits(block.Content, sec, block.Type)
+	if err != nil {
+		return nil, err
 	}
-
 	lines := strings.Split(block.Content, "\n")
-	var items [][]string
-	var cur []string
+	if fit || len(lines) < 3 {
+		ch, err := c.makeChunk(block.Content, block, sec)
+		return []types.Chunk{ch}, err
+	}
+	return c.packItems(ctx, lines[2:], lines[0]+"\n"+lines[1]+"\n", block, sec)
+}
 
-	for _, line := range lines {
+func (c *Chunker) chunkList(ctx context.Context, block types.Block, sec types.Section) ([]types.Chunk, error) {
+	fit, err := c.fits(block.Content, sec, block.Type)
+	if err != nil {
+		return nil, err
+	}
+	if fit {
+		ch, err := c.makeChunk(block.Content, block, sec)
+		return []types.Chunk{ch}, err
+	}
+	var items []string
+	var cur []string
+	for _, line := range strings.Split(block.Content, "\n") {
 		if isListItemStart(line) && len(cur) > 0 {
-			items = append(items, cur)
+			items = append(items, strings.Join(cur, "\n"))
 			cur = nil
 		}
 		cur = append(cur, line)
 	}
 	if len(cur) > 0 {
-		items = append(items, cur)
+		items = append(items, strings.Join(cur, "\n"))
 	}
-
-	var chunks []types.Chunk
-	var batch []string
-	batchTokens := 0
-
-	for _, item := range items {
-		text := strings.Join(item, "\n")
-		t := countTokens(text)
-		if len(batch) > 0 && batchTokens+t > c.cfg.MaxTokens {
-			chunks = append(chunks, c.makeChunk(strings.Join(batch, "\n"), block, sec))
-			batch = nil
-			batchTokens = 0
-		}
-		batch = append(batch, text)
-		batchTokens += t
-	}
-	if len(batch) > 0 {
-		chunks = append(chunks, c.makeChunk(strings.Join(batch, "\n"), block, sec))
-	}
-	return chunks
+	return c.packItems(ctx, items, "", block, sec)
 }
 
-func (c *Chunker) makeChunk(text string, block types.Block, sec types.Section) types.Chunk {
+func (c *Chunker) makeChunk(text string, block types.Block, sec types.Section) (types.Chunk, error) {
 	path := sec.Path
 	if path == nil {
 		path = []string{}
 	}
-	embedText := text
-	if c.cfg.PrependSectionPath && len(path) > 0 {
-		embedText = strings.Join(path, " > ") + "\n\n" + text
+	embedText := c.embedText(text, sec, block.Type)
+	size := c.length(text)
+	e, err := c.embeddingLength(embedText)
+	if err != nil {
+		return types.Chunk{}, err
 	}
-	return types.Chunk{
-		Text:        text,
-		EmbedText:   embedText,
-		Section:     sec.Title,
-		SectionPath: path,
-		BlockType:   block.Type,
-		SourceLines: [2]int{block.LineStart, block.LineEnd},
-		TokenCount:  countTokens(text),
-		Source:      c.cfg.Source,
+	reason := "atomic_block"
+	switch block.Type {
+	case types.BlockText:
+		reason = "indivisible_word"
+	case types.BlockTable:
+		reason = "table_header_or_row"
+	case types.BlockList:
+		reason = "list_item"
 	}
+	ch := types.Chunk{
+		Size: size, SizeUnit: c.cfg.LengthUnit, Oversized: c.cfg.MaxTokens > 0 && size > c.cfg.MaxTokens,
+		Text: text, EmbedText: embedText, Section: sec.Title, SectionPath: path,
+		BlockType: block.Type, SourceLines: [2]int{block.LineStart, block.LineEnd},
+		TokenCount: countTokens(text), Source: c.cfg.Source,
+	}
+	if ch.Oversized {
+		ch.OversizeReason = reason
+	}
+	if b := c.cfg.EmbeddingBudget; b != nil {
+		ch.EmbeddingTokens = e
+		ch.EmbeddingTokenizer = b.Tokenizer
+		ch.EmbeddingOversized = e > b.MaxTokens
+		if ch.EmbeddingOversized {
+			ch.EmbeddingOversizeReason = reason
+			n, err := c.embeddingLength(c.embedText("", sec))
+			if err != nil {
+				return types.Chunk{}, err
+			}
+			if n > b.MaxTokens {
+				ch.EmbeddingOversizeReason = "embedding_prefix_or_special_tokens"
+			}
+		}
+	}
+	return ch, nil
 }
 
 func assignIDs(chunks []types.Chunk) {

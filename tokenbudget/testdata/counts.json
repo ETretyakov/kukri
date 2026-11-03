@@ -1,0 +1,89 @@
+{
+  "reference": "Hugging Face tokenizers 0.23.3; before enabling truncation/padding",
+  "cases": [
+    {
+      "text": "",
+      "count": 2
+    },
+    {
+      "text": "hello world",
+      "count": 4
+    },
+    {
+      "text": "HELLO\u0000WORLD",
+      "count": 3
+    },
+    {
+      "text": "Café naïve İSTANBUL",
+      "count": 5
+    },
+    {
+      "text": "é‍ A B\tC",
+      "count": 6
+    },
+    {
+      "text": "ab",
+      "count": 3
+    },
+    {
+      "text": "a͸b",
+      "count": 3
+    },
+    {
+      "text": "a߽b",
+      "count": 3
+    },
+    {
+      "text": "ab࢐cd",
+      "count": 3
+    },
+    {
+      "text": "中文",
+      "count": 4
+    },
+    {
+      "text": "𠀀漢字",
+      "count": 5
+    },
+    {
+      "text": "[CLS]hello[MASK]world[SEP]",
+      "count": 7
+    },
+    {
+      "text": "[mask]",
+      "count": 5
+    },
+    {
+      "text": "abcd",
+      "count": 4
+    },
+    {
+      "text": "abcde",
+      "count": 3
+    },
+    {
+      "text": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+      "count": 3
+    },
+    {
+      "text": "a b",
+      "count": 4
+    },
+    {
+      "text": "a b",
+      "count": 4
+    },
+    {
+      "text": "𫠰",
+      "count": 3
+    },
+    {
+      "text": "𫤰",
+      "count": 3
+    },
+    {
+      "text": "a﻿b",
+      "count": 3
+    }
+  ]
+}

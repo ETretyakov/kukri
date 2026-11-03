@@ -1,314 +1,208 @@
 # kukri
 
-A Go library and CLI for **structure-aware chunking** of markdown documents. Kukri parses document structure (headers, tables, code blocks, lists), groups content into sections with breadcrumb paths, and merges adjacent blocks greedily by size — producing compact, structurally-coherent chunks with zero ML dependencies.
+Kukri is a Go library for structure-aware chunking of Markdown, intended for retrieval pipelines. It parses typed blocks, groups them by heading hierarchy, and packs text within sections. The core requires no embedding model or external runtime.
 
-Embedding happens outside the chunker, in your retrieval system. Kukri provides a `Scorer` interface as an extension point if you want to influence merge decisions with similarity, but the default (size-based merge with `nil` scorer) already outperforms pure-semantic and fixed-token alternatives.
+An optional document budget performs extractive compression before indexing: it
+selects whole chunks under total token and chunk limits using fixed lexical
+weights and local context rules. Compression requires no neural-model inference.
+Choose a budget by measuring retrieval quality on the documents and queries
+used by your application.
 
----
+## Library
 
-## Why kukri?
-
-Benchmark on 886 QA pairs from 248 IAEA technical publications (95% CI ≈ ±1.6 pp). Fair comparison: same model (`BAAI/bge-small-en-v1.5`), same `max-tokens=128`:
-
-| Strategy          | Coverage↑ | Hit@1↑    | Hit@3↑    | Hit@5↑    | AvgTok | Chunks  |
-|-------------------|-----------|-----------|-----------|-----------|--------|---------|
-| **kukri**         | **95.4%** | **56.0%** | **75.1%** | **80.9%** | 70.5   | 149 357 |
-| markdown splitter | 79.6%     | 46.1%     | 59.6%     | 64.2%     | 41.2   | 244 037 |
-
-- **Coverage** — % of gold answer spans contained in at least one chunk (higher = less information loss)
-- **Hit@k** — % of questions where the correct chunk appears in the top-k by cosine similarity to the question embedding (the real RAG metric)
-
-Kukri leads across every metric: **+15.8 pp Coverage**, **+9.9 pp Hit@1**, **+16.7 pp Hit@5**, with **40% fewer chunks**.
-
----
-
-## How it works
-
-The pipeline has three stages:
-
-```
-Markdown text
-    │
-    ▼
-[1] Parser        — line-by-line scan → typed blocks
-                    (text, table, code, diagram, list, image, header)
-    │
-    ▼
-[2] Segmenter     — group blocks under headings → sections with breadcrumb paths
-    │
-    ▼
-[3] Chunker       — greedy block merge within each section
-                    adjacent blocks merge while combined tokens ≤ max-tokens
-                    (and optional: while similarity ≥ threshold via Scorer)
-                    oversized single blocks split at sentence boundaries
-                    tables split row-by-row keeping header
-                    code/diagrams kept whole
-    │
-    ▼
-[]Chunk{ID, PrevID, NextID, Text, EmbedText, Section, SectionPath, BlockType, SourceLines, TokenCount, Source}
+```go
+c := kukri.New(kukri.Config{
+    MaxTokens: 128, // historical field name; the default unit is WORDS
+    MergeMode: kukri.MergeSize,
+}, nil)
+chunks, err := c.Chop(ctx, markdownText)
 ```
 
-Each chunk carries two text fields:
-- **`Text`** — the display content (what you store and show to users)
-- **`EmbedText`** — the text to embed (equals `Text` by default; with `-prepend-section-path` it prepends the breadcrumb path `"Ch2 > Safety\n\nText..."`)
+Always check `err`. Configuration errors are reported by `Chop`, including on empty input.
 
----
+Three explicit merge modes are available:
 
-## Installation
+| Mode | Behavior |
+| --- | --- |
+| `MergeSize` (default) | Merge adjacent text blocks while the complete candidate fits the budget |
+| `MergeNone` | Do not merge text blocks; oversized paragraphs still undergo splitting |
+| `MergeSimilarity` | Require a Scorer and a threshold in `[0,1]`, as well as the size constraint |
 
-```bash
-go get github.com/ETretyakov/kukri
+Merging never crosses a heading or a non-text block. The budget applies to the complete accumulated group, not just the last pair. A Scorer receives one **contiguous text run** at a time, not all text scattered through a section. It must return exactly `len(texts)-1` finite scores in `[-1,1]`.
+
+```go
+import "github.com/ETretyakov/kukri/scorer"
+
+c := kukri.New(kukri.Config{
+    MaxTokens: 128,
+    MergeMode: kukri.MergeSimilarity,
+    Threshold: 0.4,
+}, scorer.TFIDF{})
 ```
 
-No CGo, no system libraries, zero dependencies.
+The built-in TF-IDF reference uses raw term frequency and smooth IDF `log((1+n)/(1+df))+1`, fitted per contiguous text run. Terms are lowercase Unicode letter/digit sequences; there is no stemming or stopword removal. This is a lexical comparator, not an embedding model. Its usefulness must be measured on the intended corpus.
 
----
+### Size and indivisible elements
+
+The default counter is `len(strings.Fields(text))`. `MaxTokens` and JSON `token_count` retain their historical names; they do **not** denote a model's BPE/WordPiece tokens. `token_count` always counts words. `size` and `size_unit` describe the configured length measure.
+
+- Text: pack sentences; split a sentence at word boundaries if it is too long.
+- Tables: split on rows and repeat the first two header/separator lines.
+- Lists: split at item markers at the start of a line; indented lines stay within their item.
+- Code, diagrams and image placeholders: preserve the complete block.
+
+A single table row with its header, a list item or an atomic code block can exceed the budget. Such chunks carry `oversized: true` and an `oversize_reason`. `OversizePolicy: kukri.OversizeError` rejects them instead. The default is `OversizeKeep`.
+
+Use `LengthFunc func(string) int` and `LengthUnit` to supply another deterministic counter. It must return zero for empty text and a positive count for nonempty text. Complete candidates, including separators, are measured; additivity is not assumed. A word that alone exceeds a custom tokenizer budget is also reported as oversized.
+
+### Complete embedding inputs and repacking
+
+`EmbeddingBudget` adds a separate limit on the complete `EmbedText`, including heading paths and tokenizer special tokens. `CountTokens func(string) (int, error)` must be deterministic and count without padding or truncation; an empty string may consume special tokens. Counter errors abort processing. The counter must be safe for concurrent use when the chunker is shared. `MaxTokens: 0` disables the body limit only when an embedding budget is configured.
+
+```go
+import "github.com/ETretyakov/kukri/tokenbudget"
+
+counter, err := tokenbudget.FromFile("/path/to/tokenizer.json")
+if err != nil { /* handle error */ }
+c := kukri.New(kukri.Config{
+    MaxTokens: 0, // use the complete embedding-token budget alone
+    EmbeddingBudget: counter.Budget(256),
+    RepackText: true,
+    PrependSectionPath: true,
+    CompactTableEmbedding: true,
+    OversizePolicy: kukri.OversizeError,
+}, nil)
+```
+
+The optional local adapter supports the uncased BERT WordPiece profile used by BGE and MiniLM; see [its supported configuration and compatibility checks](tokenbudget/README.md). Other tokenizers can provide the callback directly. Input limits belong to the embedding model: a tokenizer file does not by itself establish that limit.
+
+`RepackText` first splits oversized paragraphs and then greedily packs the fragments, preserving paragraph separators and structural boundaries. It is opt-in and requires `MergeSize`. `CompactTableEmbedding` removes padding and shortens Markdown delimiter rows in the embedding view only; `Text` stays unchanged. Both options default to false.
+
+When the embedding budget is enabled, chunks report `embedding_tokens`, `embedding_tokenizer`, `embedding_oversized` and `embedding_oversize_reason`. A long heading prefix, indivisible word, row or atomic block can still exceed the limit under `keep`. `error` rejects violations of either active budget, so a successful call under that policy contains no measured overflow. Kukri never silently truncates these elements. If metadata alone is too long, text splitting retains ordinary body-budget behavior instead of exploding into one chunk per word. Callers must handle these exceptions or revise their context policy before embedding.
+
+### Total document budget and extractive compression
+
+`DocumentBudget` enables **lossy selection of whole finished chunks**. For
+example, keep at most half of the original embedding-input tokens, and no more
+than 12 chunks:
+
+```go
+counter, err := tokenbudget.FromFile("/path/to/tokenizer.json")
+if err != nil { /* handle error */ }
+c := kukri.New(kukri.Config{
+    MaxTokens: 0,
+    EmbeddingBudget: counter.Budget(256),
+    RepackText: true,
+    PrependSectionPath: true,
+    DocumentBudget: &kukri.DocumentBudget{
+        RetainFraction: 0.5,
+        MaxChunks: 12,
+        Strategy: kukri.SelectTermsContext,
+    },
+}, nil)
+result, err := c.ChopWithReport(ctx, markdownText)
+// result.Chunks contains the retained source chunks.
+// result.Compression reports original/selected chunks and tokens, omissions,
+// effective limits, and whether no candidate fitted.
+```
+
+`DocumentBudget.MaxTokens` is an optional absolute total **model-token** limit,
+unlike the historical word-count field `Config.MaxTokens`. It and `RetainFraction`
+require `EmbeddingBudget`. The cost is the sum of the measured complete
+`EmbedText` inputs, including every prefix, repeated header and special token.
+It does not include any extra windows, text or tokens added downstream.
+`RetainFraction` is in `(0,1]`; the effective cap is rounded down. All specified
+limits apply together. Zero-valued fields disable individual limits; an empty
+`DocumentBudget` is an error. A nil budget preserves existing behavior and JSON.
+
+| Strategy | Selection |
+| --- | --- |
+| `SelectUniform` / `uniform` | Spread candidates by repeatedly bisecting source-order intervals; accept those that fit |
+| `SelectTerms` / `terms` | Recompute weighted term coverage per added token, reducing the contribution of repetitions |
+| `SelectTermsContext` / `terms-context` (default) | The same selection, with preceding text context retained for table/list/code/diagram chunks in the same section |
+
+Term weights use log-frequency in the original parsed blocks, recurring adjacent
+2/3-word phrases, uppercase abbreviations, and name candidates detected by
+capitalization. The fixed EN/RU stop list affects scoring only. This is a lexical
+heuristic without stemming or a named-entity model; capitalized words are not
+guaranteed to be names, and repeated phrases are not guaranteed to be terms.
+Repeated output headers do not inflate source frequencies. Each feature receives
+`log(1 + frequency) * (1 + 0.5 * (words - 1) + 0.5 * abbreviation + 0.25 * proper)`.
+The last two indicators apply only to single-word features. Selected chunks reduce
+the contribution of a repeated feature to `weight / (1 + previous chunks)`.
+
+Context links are an adjacency heuristic, not a guarantee of semantic coherence:
+the immediately preceding text source group is retained with a structural block.
+Split table/list chunks share that requirement. It needs valid source line ranges,
+which the built-in parser supplies. It does not resolve arbitrary references or
+all natural-language dependencies.
+The selector is greedy; it does not guarantee an optimal summary or nested
+selections across different budgets.
+
+Content, including stop words and negations, stays unchanged in retained chunks.
+IDs and source order are preserved; `PrevID`/`NextID` now link the retained sequence
+and can skip omitted source content. Keep the original document for provenance.
+There is no implicit source expansion after selection. A tiny budget can produce
+an empty chunk list with `no_candidate_fits: true`; the library does not break a
+code block or exceed the budget to force one result. Per-chunk `OversizeError`
+still rejects violations before selection. Under `keep`, an oversized chunk may
+be retained if it fits the document budget and still needs downstream handling.
+
+The original `Chop` API applies the same selection but returns only chunks.
+`ChopWithReport` and CLI output include the optional `compression` report.
+Selection is performed per document in batch mode, never across the corpus.
+
+Compression drops source material. Validate the selected budget against your own
+retrieval queries and compare it with the same index without compression. The
+reported token and chunk reductions do not guarantee preserved answer quality
+or a proportional reduction in runtime, memory or cost.
+
+### Metadata and provenance
+
+Chunks expose `ID`, `PrevID`, `NextID`, `Text`, `EmbedText`, `Section`, `SectionPath`, `BlockType`, `SourceLines`, `TokenCount`, `Size`, `SizeUnit`, `Oversized`, `OversizeReason`, and `Source`.
+
+IDs are unique **within one document**. Assign a unique `Source` to each document and use `(Source, ID)` when indexing multiple documents. `SourceLines` is an enclosing range of the original source blocks, not an exact substring coordinate: split parts may share a range and tables repeat headers. Paragraph whitespace may be normalized.
+
+`PrependSectionPath` adds the heading path to `EmbedText`, leaving `Text` unchanged. This prefix is outside the Text size budget. Enable `EmbeddingBudget` to count it with the body, or check the tokenizer limit downstream; whether the prefix helps is an empirical question for each model and dataset.
+
+### Supported Markdown
+
+The parser targets the block subset commonly found in converted technical documents: ATX headings H1-H6, fenced code (backticks or tildes, matched delimiter length), pipe-prefixed tables, consecutive list items with indented continuation lines, Docling-style image placeholders, and paragraphs. It is not a complete CommonMark/GFM parser. Setext headings, arbitrary HTML, block quotes and more complex nested block constructs are not reconstructed as a full Markdown AST. Seven or more heading hashes are ordinary text, not a valid heading level.
 
 ## CLI
 
-### Single file
-
-```bash
-go run ./cmd/chunker \
-  -input   document.md \
-  -output  chunks.json \
-  -max-tokens 128
+```sh
+go build -o kukri ./cmd/chunker
+./kukri -input document.md -max-words 128 -merge size
+./kukri -batch -input corpus.jsonl -output chunks.jsonl -max-words 128 -merge none
+./kukri -input document.md -max-words 128 -merge similarity -scorer tfidf -threshold 0.4
+./kukri -input document.md -max-words 0 -embedding-tokenizer /path/to/tokenizer.json \
+  -max-embedding-tokens 256 -repack-text -prepend-section-path \
+  -compact-table-embedding -oversize error
+./kukri -input document.md -max-words 0 -embedding-tokenizer /path/to/tokenizer.json \
+  -max-embedding-tokens 256 -repack-text -prepend-section-path \
+  -document-retain 0.5 -document-max-chunks 12 -document-selection terms-context
 ```
 
-Output is a JSON object with a `chunks` array.
+Batch input contains one `{"id":"document-id","text":"..."}` record per line. IDs must be nonempty and unique, and `text` must be a string. Empty documents produce an empty chunk list. Invalid input or processing errors cause a nonzero exit; no failed document is silently skipped. A failed batch can leave partial output, which callers must discard.
 
-### Batch mode (corpus)
+`-max-tokens` remains an alias for `-max-words`. The former `-model` and `-merge-blocks` flags are not supported.
 
-Reads JSONL from `-input` (`{"id":"...","text":"..."}` per line), writes one JSONL line per document to `-output`:
+### Migration from 7464582
 
-```bash
-go run ./cmd/chunker \
-  -batch \
-  -input   corpus.jsonl \
-  -output  chunks.jsonl \
-  -max-tokens 128
+- Replace positive `Threshold` with nil Scorer, formerly used to disable merging, with `MergeMode: MergeNone` and threshold zero.
+- Set `MergeMode: MergeSimilarity` explicitly when supplying a Scorer.
+- Large single sentences now split at word boundaries. Chunk boundaries and IDs can therefore change; rebuild the index.
+- Do not interpret `SourceLines` as precise offsets of a split fragment.
+
+## Tests
+
+```sh
+go test -race ./...
+go vet ./...
+go test -fuzz=FuzzChop -fuzztime=10s .
 ```
 
-Output format: `{"id":"...","chunks":[...]}` per line.
-
-### Flags
-
-| Flag                    | Default | Description                                                        |
-|-------------------------|---------|--------------------------------------------------------------------|
-| `-input`                |         | Input markdown file (single) or JSONL corpus (batch)               |
-| `-output`               | stdout  | Output path                                                        |
-| `-max-tokens`           | `128`   | Max words per chunk (word count, not BPE tokens)                   |
-| `-threshold`            | `0`     | Min scorer similarity to merge adjacent blocks (0 = size-only)     |
-| `-prepend-section-path` | `false` | Prepend breadcrumb path to `embed_text` (useful for BGE/E5 models) |
-| `-batch`                | `false` | Enable batch JSONL mode                                            |
-
-> **Note on token counting.** kukri counts whitespace-delimited words. English text averages ~1.3–1.5 BPE sub-word tokens per word, so `max-tokens=128` corresponds to roughly **165–190 actual LLM tokens**.
-
----
-
-## Go API
-
-### Quick start
-
-```go
-import "github.com/ETretyakov/kukri"
-
-func chunkDocument(ctx context.Context, text string) ([]kukri.Chunk, error) {
-	c := kukri.New(kukri.Config{
-		MaxTokens: 128,
-		Threshold: 0,
-		Source:    "my-doc.md",
-	}, nil) // nil scorer → pure size-based merge
-
-	return c.Chop(ctx, text)
-}
-```
-
-### With a custom scorer
-
-```go
-import (
-    "github.com/ETretyakov/kukri"
-    "github.com/ETretyakov/kukri/scorer"
-)
-
-// Implement scorer.Scorer to influence merge decisions:
-//
-//   type Scorer interface {
-//       Score(ctx context.Context, texts []string) ([]float32, error)
-//   }
-//
-// Score receives N block texts and must return N-1 pairwise similarity scores.
-// Blocks i and i+1 are merged when sims[i] >= threshold AND combined tokens <= MaxTokens.
-
-c := kukri.New(kukri.Config{MaxTokens: 256, Threshold: 0.6}, myScorer)
-```
-
-### Individual pipeline stages
-
-```go
-import (
-    "github.com/ETretyakov/kukri/parser"
-    "github.com/ETretyakov/kukri/segmenter"
-    "github.com/ETretyakov/kukri/chunker"
-    "github.com/ETretyakov/kukri/types"
-)
-
-blocks   := parser.Parse(markdownText)
-sections := segmenter.Segment(blocks)
-
-c := chunker.New(types.Config{MaxTokens: 128, Threshold: 0}, nil)
-chunks, _ := c.Chop(ctx, sections)
-```
-
-### Chunk schema
-
-```go
-type Chunk struct {
-	ID          string    // "introduction_0", "methods_3", …
-	PrevID      string    // ID of preceding chunk (empty for first)
-	NextID      string    // ID of following chunk (empty for last)
-	Text        string    // display content
-	EmbedText   string    // text to embed (may include section-path prefix)
-	Section     string    // nearest heading title
-	SectionPath []string  // breadcrumb: ["Chapter 1", "1.2 Methods"]
-	BlockType   BlockType // "text" | "table" | "code" | "diagram" | "list" | "image"
-	SourceLines [2]int    // [start, end] line numbers in source markdown
-	TokenCount  int       // word count of Text
-	Source      string    // source filename / doc ID
-}
-```
-
----
-
-## Benchmarks
-
-### Dataset
-
-886 QA pairs generated by `claude-haiku-4-5` from 248 IAEA technical publications.  
-Each pair: a verbatim answer span extracted from one document + a question about it.
-
-### Full results
-
-All rows at `max-tokens=128`. `BGE-small` = `BAAI/bge-small-en-v1.5`, `MiniLM` = `sentence-transformers/all-MiniLM-L6-v2`.
-
-| config                           | Coverage↑ | Hit@1↑    | Hit@3↑    | Hit@5↑    | AvgTok | Chunks  |
-|----------------------------------|-----------|-----------|-----------|-----------|--------|---------|
-| **kukri · BGE-small**            | **95.4%** | **56.0%** | **75.1%** | **80.9%** | 70.5   | 149 357 |
-| kukri · BGE-small + section-path | 95.4%     | 56.5%     | 74.5%     | 81.5%     | 70.5   | 149 357 |
-| markdown splitter · BGE-small    | 79.6%     | 46.1%     | 59.6%     | 64.2%     | 41.2   | 244 037 |
-| kukri · MiniLM                   | 95.4%     | 39.3%     | 60.3%     | 67.4%     | 70.5   | 149 357 |
-| baseline (no merge) · MiniLM     | 94.9%     | 36.6%     | 56.7%     | 66.8%     | 53.3   | 183 113 |
-| markdown splitter · MiniLM       | 99.6%     | 37.8%     | 60.1%     | 69.5%     | 134.0  | 75 396  |
-
-### Running the benchmark
-
-```bash
-cd kukri
-
-# Set up Python env
-python3 -m venv bench/.venv
-bench/.venv/bin/pip install -r bench/requirements.txt
-
-# Build corpus from parsed markdown files
-bench/.venv/bin/python3 bench/make_corpus.py \
-  --input  ../parsing/output \
-  --output corpus.jsonl
-
-# Generate gold QA pairs (requires ANTHROPIC_API_KEY)
-ANTHROPIC_API_KEY=sk-... bench/.venv/bin/python3 bench/generate_gold.py \
-  --input  corpus.jsonl \
-  --output bench/gold.jsonl \
-  --pairs-per-doc 5
-
-# Sweep kukri thresholds and measure Hit@k (with markdown splitter baseline)
-KUKRI_BIN=./kukri bench/.venv/bin/python3 bench/sweep_threshold.py \
-  --gold         bench/gold.jsonl \
-  --corpus       corpus.jsonl \
-  --max-tokens   128 \
-  --thresholds   0.0 \
-  --embed-model  BAAI/bge-small-en-v1.5 \
-  --baseline
-```
-
-Build the binary first: `go build -o kukri ./cmd/chunker`
-
----
-
-## Design decisions
-
-### Why there is no embedding model inside the chunker
-
-The original design embedded sentences with `all-MiniLM-L6-v2` via hugot (pure-Go ONNX, CPU-only) and used cosine similarity to merge adjacent sentences. Three problems surfaced:
-
-1. **The fast path killed semantic merging.** IAEA documents average ~53 tokens per paragraph block. The code path was: if the block fits in `MaxTokens`, emit it as-is and skip the embedder. With `MaxTokens=512`, 100% of blocks hit the fast path — the embedder was never called.
-
-2. **hugot on CPU is 10–20× slower than GPU inference.** Even if the embedder ran, chunking 248 documents took minutes on CPU. The retrieval system already runs a GPU-accelerated embedder for indexing; running a second, slower embedder in the chunker adds latency and model version skew.
-
-3. **TF-IDF-based similarity didn't improve over size-based merge.** A sweep across threshold values (0.0 to 0.8) with TF-IDF cosine similarity showed identical Hit@k to `threshold=0` across all configurations. Adjacent IAEA paragraphs are already topically coherent; similarity-based gating just prevented valid merges at high thresholds.
-
-**Conclusion:** embedding belongs in the retrieval system, not the chunker. The chunker's job is structure preservation and size control. The `Scorer` interface remains as an extension point for future experimentation.
-
-### Why BGE-small outperforms MiniLM by +16.7 pp Hit@1
-
-`BAAI/bge-small-en-v1.5` is trained with hard negative mining for asymmetric retrieval (question → passage). It uses a query prefix to distinguish query-side embeddings from passage-side embeddings. `all-MiniLM-L6-v2` is trained for symmetric sentence similarity.
-
-For RAG the retrieval task is asymmetric: a user question is matched against document passages. BGE's training objective aligns directly with this use case; MiniLM's does not. The difference is +16.7 pp Hit@1 and +14.8 pp Hit@3 on identical chunks.
-
-### Why the section-path prefix is opt-in
-
-`-prepend-section-path` prepends the breadcrumb (`"Ch2 > Safety\n\n"`) to `EmbedText` before encoding. This works for models trained to incorporate document structure (E5, BGE with instructed variants). For `all-MiniLM-L6-v2` it hurts: IAEA documents have generic section names ("Introduction", "Background", "Conclusions") that add noise without adding discriminative signal.
-
-### PrevID / NextID as context hooks
-
-Every chunk carries `PrevID` and `NextID`. Retrieval systems can use these to expand the retrieved context window at query time ("sentence-window retrieval") without storing the expansion in the chunk itself. This keeps chunks compact while allowing the reader to see surrounding context.
-
----
-
-## Repository layout
-
-```
-kukri/
-├── kukri.go            — root package: Chunker, Scorer type alias
-├── types/              — shared types: Chunk, Config, Block, Section, BlockType
-├── parser/             — markdown → []Block
-├── segmenter/          — []Block → []Section (header grouping + breadcrumbs)
-├── scorer/             — Scorer interface (extension point; no built-in implementations)
-├── chunker/            — []Section → []Chunk (greedy block merge + type-aware splitting)
-├── cmd/
-│   └── chunker/        — CLI entry point (single-file and batch modes)
-└── bench/
-    ├── sweep_threshold.py — Hit@k + Coverage benchmark sweep
-    ├── generate_gold.py   — LLM-based gold QA pair generator
-    ├── make_corpus.py     — corpus.jsonl builder from markdown files
-    └── requirements.txt
-```
-
----
-
-## Conclusion
-
-Kukri outperforms the markdown splitter on every metric when the comparison is fair (same model, same `max-tokens`):
-
-| metric   | kukri   | markdown splitter | delta        |
-|----------|---------|-------------------|--------------|
-| Coverage | 95.4%   | 79.6%             | **+15.8 pp** |
-| Hit@1    | 56.0%   | 46.1%             | **+9.9 pp**  |
-| Hit@3    | 75.1%   | 59.6%             | **+15.5 pp** |
-| Hit@5    | 80.9%   | 64.2%             | **+16.7 pp** |
-| Chunks   | 149 357 | 244 037           | **−39%**     |
-
-The coverage gap tells the core story: `RecursiveCharacterTextSplitter` cuts on character count and routinely splits answer spans across chunk boundaries. Kukri respects document structure — paragraphs, tables, lists — so spans stay intact. This also produces 40% fewer, more cohesive chunks, which shrinks the index and speeds up retrieval.
-
-Two independent levers control retrieval quality:
-
-1. **Chunking strategy** (this library) — determines Coverage and chunk coherence. Kukri's block-aware merge gives +15.8 pp Coverage over character splitting.
-2. **Embedding model** (your retrieval system) — determines how well queries match chunks. Switching from MiniLM to BGE-small gives +16.7 pp Hit@1 on the same chunks.
-
-Both levers matter. A good chunker with a weak model, or a strong model with character-split chunks, both leave significant performance on the table.
-
----
-
-## License
-
-MIT
+Tests cover cumulative and document budgets, token counting, retained source
+content, oversize handling, invalid scorer responses, parser boundaries, batch
+failures and randomized Markdown inputs.

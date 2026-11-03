@@ -46,7 +46,7 @@ type Chunk struct {
 	PrevID string `json:"prev_id,omitempty"`
 	NextID string `json:"next_id,omitempty"`
 
-	// Text is the raw chunk content as it appears in the source document.
+	// Text preserves content order; paragraph whitespace may be normalized.
 	Text string `json:"text"`
 
 	// EmbedText is the text to pass to the embedding model.
@@ -66,11 +66,26 @@ type Chunk struct {
 	BlockType BlockType `json:"block_type"`
 
 	// SourceLines is the [start, end] 1-based line range in the source
-	// Markdown that this chunk was derived from.
+	// Markdown enclosing the source block(s). Split parts may share this range;
+	// it is not an exact substring location after normalization or header repetition.
 	SourceLines [2]int `json:"source_lines"`
 
 	// TokenCount is the whitespace-delimited word count of Text.
 	TokenCount int `json:"token_count"`
+
+	// Size is the length of Text under Config.LengthFunc (words by default).
+	Size     int    `json:"size"`
+	SizeUnit string `json:"size_unit"`
+	// Oversized identifies an indivisible element that exceeds MaxTokens.
+	Oversized      bool   `json:"oversized,omitempty"`
+	OversizeReason string `json:"oversize_reason,omitempty"`
+
+	// EmbeddingTokens measures the complete EmbedText, including tokenizer special
+	// tokens, when Config.EmbeddingBudget is enabled. No truncation is applied.
+	EmbeddingTokens         int    `json:"embedding_tokens,omitempty"`
+	EmbeddingTokenizer      string `json:"embedding_tokenizer,omitempty"`
+	EmbeddingOversized      bool   `json:"embedding_oversized,omitempty"`
+	EmbeddingOversizeReason string `json:"embedding_oversize_reason,omitempty"`
 
 	// Source is the filename or document ID set via Config.Source.
 	Source string `json:"source"`
@@ -78,29 +93,107 @@ type Chunk struct {
 
 // Result is the top-level envelope written to JSON in single-file mode.
 type Result struct {
-	Chunks []Chunk `json:"chunks"`
+	Chunks      []Chunk            `json:"chunks"`
+	Compression *CompressionReport `json:"compression,omitempty"`
+}
+
+// SelectionStrategy selects whole output chunks under a document budget.
+type SelectionStrategy string
+
+const (
+	SelectUniform      SelectionStrategy = "uniform"
+	SelectTerms        SelectionStrategy = "terms"
+	SelectTermsContext SelectionStrategy = "terms-context"
+)
+
+// DocumentBudget enables lossy, query-independent selection after chunking.
+// Zero fields are disabled. At least one limit must be set. Token limits require
+// EmbeddingBudget and sum its counts over complete EmbedText inputs, including
+// repeated headers and special tokens. They do not count downstream windows.
+type DocumentBudget struct {
+	MaxTokens int
+	MaxChunks int
+	// RetainFraction optionally caps tokens at floor(fraction * original tokens).
+	// Values are in (0,1]; when MaxTokens is also set, the smaller limit applies.
+	RetainFraction float64
+	// Defaults to SelectTermsContext. Uniform is a control, not a salience model.
+	Strategy SelectionStrategy
+}
+
+// CompressionReport makes omissions and budget utilization explicit.
+type CompressionReport struct {
+	Strategy           SelectionStrategy `json:"strategy"`
+	OriginalChunks     int               `json:"original_chunks"`
+	SelectedChunks     int               `json:"selected_chunks"`
+	OmittedChunks      int               `json:"omitted_chunks"`
+	OriginalTokens     int               `json:"original_tokens,omitempty"`
+	SelectedTokens     int               `json:"selected_tokens,omitempty"`
+	TokenBudgetEnabled bool              `json:"token_budget_enabled"`
+	TokenLimit         int               `json:"token_limit"`
+	ChunkLimit         int               `json:"chunk_limit,omitempty"`
+	ContextAddedChunks int               `json:"context_added_chunks,omitempty"`
+	NoCandidateFits    bool              `json:"no_candidate_fits,omitempty"`
+}
+
+// MergeMode selects how adjacent text blocks are combined.
+type MergeMode string
+
+const (
+	MergeSize       MergeMode = "size"
+	MergeNone       MergeMode = "none"
+	MergeSimilarity MergeMode = "similarity"
+)
+
+// OversizePolicy controls indivisible words, rows, list items and code blocks.
+type OversizePolicy string
+
+const (
+	OversizeKeep  OversizePolicy = "keep"
+	OversizeError OversizePolicy = "error"
+)
+
+// EmbeddingBudget constrains the complete model input independently of the body
+// budget. CountTokens must count without truncation or padding, include the model's
+// special tokens and be deterministic. Empty inputs may have a nonzero count.
+// For concurrent use of Chunker, the callback must also be safe for concurrent use.
+type EmbeddingBudget struct {
+	MaxTokens   int
+	Tokenizer   string // identifying name or immutable tokenizer hash
+	CountTokens func(string) (int, error)
 }
 
 // Config holds the parameters that control the chunking pipeline.
 type Config struct {
-	// MaxTokens is the soft upper limit on chunk size (word count).
-	// Adjacent text blocks are merged until adding the next block would
-	// exceed this limit. Code/image/diagram blocks are always emitted whole.
+	// MaxTokens limits Text length. The historical name is retained for API
+	// compatibility: the default unit is whitespace-delimited words, not BPE.
+	// Zero disables the body limit only when EmbeddingBudget is configured.
+	// Atomic elements that cannot fit are marked or rejected by OversizePolicy.
 	MaxTokens int
-
-	// Threshold is the minimum similarity score [0, 1] required to merge
-	// two adjacent blocks. With no Scorer (nil), block similarities are
-	// always 0, so Threshold=0 merges everything up to MaxTokens and
-	// Threshold>0 keeps blocks separate.
+	// MergeMode defaults to MergeSize. Similarity requires a non-nil Scorer.
+	MergeMode MergeMode
+	// Threshold in [0,1] is used only by MergeSimilarity. Other modes require 0.
 	Threshold float32
-
-	// Source is the filename or document ID attached to every chunk's Source field.
-	Source string
-
-	// PrependSectionPath prepends the section breadcrumb to EmbedText:
-	//   "Chapter 2 > Safety Analysis\n\n[chunk text]"
-	// Default false: EmbedText == Text.
-	// Beneficial for models trained with passage-prefix formats (BGE, E5);
-	// hurts retrieval quality with all-MiniLM-L6-v2.
+	// LengthFunc defaults to whitespace word count. A custom counter must be
+	// deterministic, return 0 for empty text and a positive count otherwise.
+	// Full candidate text is measured: additivity is not assumed.
+	LengthFunc func(string) int
+	// LengthUnit is required for a custom counter, e.g. "cl100k_base_tokens".
+	LengthUnit string
+	// OversizePolicy defaults to OversizeKeep; exceptions carry a reason.
+	OversizePolicy OversizePolicy
+	Source         string
+	// RepackText splits oversized paragraphs before greedily packing their
+	// fragments within each uninterrupted text run. Opt-in; requires MergeSize.
+	RepackText bool
+	// CompactTableEmbedding removes table padding and shortens Markdown
+	// delimiter rows in EmbedText only; cell values and Text are retained.
+	CompactTableEmbedding bool
+	// EmbeddingBudget optionally limits full EmbedText as well as Text.
+	EmbeddingBudget *EmbeddingBudget
+	// DocumentBudget optionally selects a subset of the finished chunks.
+	// Omitted content is not recoverable from that subset; retain the source.
+	DocumentBudget *DocumentBudget
+	// PrependSectionPath affects EmbedText only. The prefix is outside the Text
+	// budget, but is included in EmbeddingBudget when enabled.
 	PrependSectionPath bool
 }
