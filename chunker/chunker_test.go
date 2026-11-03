@@ -23,7 +23,7 @@ func textSection(title string, content string) types.Section {
 }
 
 func newChunker(maxTokens int) *Chunker {
-	return New(types.Config{MaxTokens: maxTokens, Threshold: 0.7}, nil)
+	return New(types.Config{MaxTokens: maxTokens, MergeMode: types.MergeNone}, nil)
 }
 
 // ── countTokens ──────────────────────────────────────────────────────────────
@@ -277,7 +277,7 @@ func TestChop_CodeBlockAlwaysWholeChunk(t *testing.T) {
 	c := newChunker(2)
 	code := "```go\n" + strings.Repeat("x := 1\n", 50) + "```"
 	secs := []types.Section{{
-		Title: "Code",
+		Title:  "Code",
 		Blocks: []types.Block{{Type: types.BlockCode, Content: code}},
 	}}
 	chunks, err := c.Chop(context.Background(), secs)

@@ -244,3 +244,25 @@ func TestIsContinuation(t *testing.T) {
 		t.Error("blank indented line should not be continuation")
 	}
 }
+
+func TestHeadingLimitsAndWhitespace(t *testing.T) {
+	for _, text := range []string{"####### text", "######## text"} {
+		blocks := Parse(text)
+		if len(blocks) != 1 || blocks[0].Type != types.BlockText || blocks[0].Content != text {
+			t.Fatal(blocks)
+		}
+	}
+	blocks := Parse("  ##\tTitle ###\r\nbody\r\n")
+	if blocks[0].Level != 2 || blocks[0].Content != "Title" || blocks[1].Content != "body" {
+		t.Fatal(blocks)
+	}
+}
+
+func TestFenceDelimiterMustMatch(t *testing.T) {
+	for _, text := range []string{"````md\n```\nstill code\n````", "~~~go\n# code\n~~~"} {
+		blocks := Parse(text)
+		if len(blocks) != 1 || blocks[0].Type != types.BlockCode || blocks[0].Content != text {
+			t.Fatal(blocks)
+		}
+	}
+}

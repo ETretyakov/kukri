@@ -1,7 +1,7 @@
 // Package parser converts raw Markdown text into a flat slice of typed
 // [types.Block] values.
 //
-// The scanner is purely line-by-line (O(n) time and memory) and recognises:
+// The scanner is line-by-line (O(N) in input bytes for fixed syntax rules) and recognises:
 //   - Fenced code blocks (``` … ```) and diagram blocks (```mermaid / plantuml / dot)
 //   - Pipe tables (lines starting with |)
 //   - ATX headers (# … ######)
@@ -22,7 +22,7 @@ import (
 // Blocks are emitted in document order; headers themselves are included
 // as [types.BlockHeader] so the segmenter can reconstruct the hierarchy.
 func Parse(md string) []types.Block {
-	lines := strings.Split(md, "\n")
+	lines := strings.Split(strings.ReplaceAll(md, "\r\n", "\n"), "\n")
 	var blocks []types.Block
 
 	i := 0
@@ -32,14 +32,14 @@ func Parse(md string) []types.Block {
 		// ── Fenced code or diagram block ────────────────────────────────────
 		// Opened by a line that starts with ```.  The language tag (if any)
 		// distinguishes diagrams (mermaid / plantuml / dot) from code.
-		if tag, ok := strings.CutPrefix(line, "```"); ok {
+		if marker, width, tag, ok := openingFence(line); ok {
 			tag = strings.TrimSpace(strings.ToLower(tag))
 			start := i
 			i++
 			buf := []string{line}
 			for i < len(lines) {
 				buf = append(buf, lines[i])
-				if strings.HasPrefix(lines[i], "```") {
+				if closingFence(lines[i], marker, width) {
 					i++
 					break
 				}
@@ -91,12 +91,12 @@ func Parse(md string) []types.Block {
 		}
 
 		// ── ATX header ───────────────────────────────────────────────────────
-		// Require one space after the hash run: "# Title", "## Sub", etc.
+		// Accept H1-H6 followed by whitespace or end of line.
 		// Lines like "#tag" (no space) fall through to the text paragraph.
 		if level, ok := atxHeaderLevel(line); ok {
 			blocks = append(blocks, types.Block{
 				Type:      types.BlockHeader,
-				Content:   strings.TrimSpace(line[level+1:]),
+				Content:   headerContent(line, level),
 				Level:     level,
 				LineStart: i + 1,
 				LineEnd:   i + 1,
@@ -106,7 +106,7 @@ func Parse(md string) []types.Block {
 		}
 
 		// ── List block ───────────────────────────────────────────────────────
-		// Collect the starting list item and any indented continuation lines.
+		// Collect consecutive list items and their indented continuation lines.
 		if isListLine(line) {
 			start := i
 			var buf []string
@@ -136,7 +136,7 @@ func Parse(md string) []types.Block {
 				strings.TrimSpace(lines[i]) != "" &&
 				!isATXHeader(lines[i]) &&
 				!strings.HasPrefix(strings.TrimSpace(lines[i]), "|") &&
-				!strings.HasPrefix(lines[i], "```") &&
+				!isFence(lines[i]) &&
 				!strings.HasPrefix(lines[i], "> **[IMAGE") &&
 				!isListLine(lines[i]) {
 				buf = append(buf, lines[i])
@@ -163,15 +163,58 @@ func Parse(md string) []types.Block {
 // ("# …", "## …", …), or (0, false) otherwise.
 // A valid ATX header requires at least one space after the hash run.
 func atxHeaderLevel(line string) (int, bool) {
+	t := strings.TrimLeft(line, " ")
+	if len(line)-len(t) > 3 {
+		return 0, false
+	}
 	level := 0
-	for level < len(line) && line[level] == '#' {
+	for level < len(t) && t[level] == '#' {
 		level++
 	}
-	if level == 0 || level >= len(line) || line[level] != ' ' {
+	if level < 1 || level > 6 {
+		return 0, false
+	}
+	if level < len(t) && t[level] != ' ' && t[level] != '\t' {
 		return 0, false
 	}
 	return level, true
 }
+
+func headerContent(line string, level int) string {
+	t := strings.TrimSpace(strings.TrimLeft(line, " ")[level:])
+	end := len(t)
+	for end > 0 && t[end-1] == '#' {
+		end--
+	}
+	if end < len(t) && (end == 0 || t[end-1] == ' ' || t[end-1] == '\t') {
+		t = strings.TrimSpace(t[:end])
+	}
+	return t
+}
+
+// Fences use at least three matching backticks or tildes, with up to three
+// leading spaces. A closer must be at least as long and have no trailing text.
+func openingFence(line string) (byte, int, string, bool) {
+	t := strings.TrimLeft(line, " ")
+	if len(line)-len(t) > 3 || len(t) < 3 || (t[0] != '`' && t[0] != '~') {
+		return 0, 0, "", false
+	}
+	n := 0
+	for n < len(t) && t[n] == t[0] {
+		n++
+	}
+	if n < 3 || (t[0] == '`' && strings.Contains(t[n:], "`")) {
+		return 0, 0, "", false
+	}
+	return t[0], n, strings.TrimSpace(t[n:]), true
+}
+
+func closingFence(line string, marker byte, width int) bool {
+	m, n, tail, ok := openingFence(line)
+	return ok && m == marker && n >= width && tail == ""
+}
+
+func isFence(line string) bool { _, _, _, ok := openingFence(line); return ok }
 
 // isATXHeader reports whether line is a valid ATX header.
 func isATXHeader(line string) bool {

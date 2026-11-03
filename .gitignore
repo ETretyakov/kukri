@@ -22,3 +22,8 @@ bench/.venv/
 # OS
 .DS_Store
 Thumbs.db
+
+# Reproducible evaluation artifacts (publish selected reports separately)
+bench/results/
+bench/cache/
+__pycache__/

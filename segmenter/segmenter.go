@@ -35,6 +35,9 @@ func Segment(blocks []types.Block) []types.Section {
 	path := make([]string, 7)
 
 	for _, b := range blocks {
+		if b.Type == types.BlockHeader && (b.Level < 1 || b.Level > 6) {
+			b.Type = types.BlockText // tolerate externally constructed invalid blocks
+		}
 		if b.Type != types.BlockHeader {
 			current.Blocks = append(current.Blocks, b)
 			continue

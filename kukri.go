@@ -14,7 +14,7 @@
 // With a custom similarity scorer:
 //
 //	var scr kukri.Scorer = myScorer{}
-//	c := kukri.New(kukri.Config{MaxTokens: 128, Threshold: 0.6}, scr)
+//	c := kukri.New(kukri.Config{MaxTokens: 128, MergeMode: kukri.MergeSimilarity, Threshold: 0.6}, scr)
 package kukri
 
 import (
@@ -29,21 +29,36 @@ import (
 
 // Type aliases so callers can use kukri.Chunk, kukri.Config, etc.
 type (
-	Chunk     = types.Chunk
-	Config    = types.Config
-	BlockType = types.BlockType
-	Block     = types.Block
-	Section   = types.Section
+	Chunk             = types.Chunk
+	Result            = types.Result
+	DocumentBudget    = types.DocumentBudget
+	CompressionReport = types.CompressionReport
+	SelectionStrategy = types.SelectionStrategy
+	Config            = types.Config
+	EmbeddingBudget   = types.EmbeddingBudget
+	BlockType         = types.BlockType
+	Block             = types.Block
+	Section           = types.Section
+	MergeMode         = types.MergeMode
+	OversizePolicy    = types.OversizePolicy
 )
 
 // BlockType constants re-exported for convenience.
 const (
-	BlockText    = types.BlockText
-	BlockTable   = types.BlockTable
-	BlockCode    = types.BlockCode
-	BlockDiagram = types.BlockDiagram
-	BlockList    = types.BlockList
-	BlockImage   = types.BlockImage
+	MergeSize          = types.MergeSize
+	MergeNone          = types.MergeNone
+	MergeSimilarity    = types.MergeSimilarity
+	OversizeKeep       = types.OversizeKeep
+	OversizeError      = types.OversizeError
+	BlockText          = types.BlockText
+	BlockTable         = types.BlockTable
+	BlockCode          = types.BlockCode
+	BlockDiagram       = types.BlockDiagram
+	BlockList          = types.BlockList
+	BlockImage         = types.BlockImage
+	SelectUniform      = types.SelectUniform
+	SelectTerms        = types.SelectTerms
+	SelectTermsContext = types.SelectTermsContext
 )
 
 // Scorer is the pairwise similarity interface, re-exported from [scorer.Scorer].
@@ -55,8 +70,8 @@ type Chunker struct {
 	inner *chunker.Chunker
 }
 
-// New creates a Chunker. scr may be nil — blocks are then merged purely by
-// token count (all similarities treated as 0).
+// New creates a Chunker. Configuration is validated by Chop. The default
+// mode merges by size; MergeSimilarity explicitly requires a Scorer.
 func New(cfg Config, scr Scorer) *Chunker {
 	return &Chunker{inner: chunker.New(cfg, scr)}
 }
@@ -66,4 +81,9 @@ func New(cfg Config, scr Scorer) *Chunker {
 // block type metadata, source line numbers, and token counts.
 func (c *Chunker) Chop(ctx context.Context, text string) ([]Chunk, error) {
 	return c.inner.Chop(ctx, segmenter.Segment(parser.Parse(text)))
+}
+
+// ChopWithReport also reports the content omitted by an enabled DocumentBudget.
+func (c *Chunker) ChopWithReport(ctx context.Context, text string) (Result, error) {
+	return c.inner.ChopWithReport(ctx, segmenter.Segment(parser.Parse(text)))
 }
